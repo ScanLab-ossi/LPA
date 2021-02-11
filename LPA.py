@@ -40,6 +40,9 @@ def distance_summary(dvr,vecs):
     for i in range(len(vecs)):
         sample_vec = np.array(vecs.iloc[i,:])
         dist_sum.iloc[i,:] = calc_distance_summary(dvr_vec,sample_vec)
+    f_max = round(max(dist_sum['distance_summary']) + 0.005,3)
+    if f_max > 1:
+        dist_sum['distance_summary'] = dist_sum['distance_summary'] / f_max
     return dist_sum
 
 
