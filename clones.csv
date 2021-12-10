@@ -1,4 +1,4 @@
-clone_id,sample_id,instance,copies,tissue
+element,category,frequency_in_category,copies,tissue
 917504,657,8,171,MLN
 917505,158,1,13,ILN
 917505,159,2,99,ILN
