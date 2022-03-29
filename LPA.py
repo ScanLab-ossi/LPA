@@ -1,7 +1,5 @@
 from itertools import combinations_with_replacement as cwr
 from itertools import product
-from typing import Optional
-from matplotlib.pyplot import isinteractive
 
 import numpy as np
 import numpy.ma as ma
@@ -19,10 +17,10 @@ class LPA:
         self.epsilon = 1 / (len(dvr) * epsilon_frac)
 
     @staticmethod
-    def create_dvr(df: pd.DataFrame) -> pd.DataFrame:
+    def create_dvr(frequency: pd.DataFrame) -> pd.DataFrame:
         """Creates the DVR table of the domain"""
         dvr = (
-            df.groupby("element", as_index=False)
+            frequency.groupby("element", as_index=False)
             .sum()
             .sort_values(by="frequency_in_category", ascending=False)
         )
@@ -31,12 +29,12 @@ class LPA:
         )
         return dvr.reset_index(drop=True)
 
-    def create_pvr(self, df: pd.DataFrame) -> pd.DataFrame:
+    def create_pvr(self, frequency: pd.DataFrame) -> pd.DataFrame:
         """Creates a vector for every category in the domain"""
-        df["local_weight"] = df["frequency_in_category"] / df.groupby("category")[
+        frequency["local_weight"] = frequency[
             "frequency_in_category"
-        ].transform("sum")
-        return df
+        ] / frequency.groupby("category")["frequency_in_category"].transform("sum")
+        return frequency
 
     @staticmethod
     def KLD(P: np.ndarray, Q: np.ndarray) -> np.ndarray:
@@ -47,7 +45,9 @@ class LPA:
         """
         return (P - Q) * (ma.log(P) - ma.log(Q))
 
-    def normalize_pvr(self, pvr, pvr_lengths, missing):
+    def normalize_pvr(
+        self, pvr: pd.DataFrame, pvr_lengths: np.array, missing: np.array
+    ) -> pd.DataFrame:
         """
         The extended pvr (with ɛ) is no longer a probability vector - the sum of all
         coordinates is now larger than 1. We correct this by multiplying all non-ɛ
@@ -65,7 +65,7 @@ class LPA:
         pvr["local_weight"] = pvr["local_weight"] * pd.Series(betas)
         return pvr
 
-    def betas(self, pvr):
+    def betas(self, pvr: pd.DataFrame) -> pd.DataFrame:
         pvr_lengths = (
             pvr["category"].drop_duplicates(keep="last").index
             - pvr["category"].drop_duplicates(keep="first").index
@@ -74,20 +74,11 @@ class LPA:
         missing = len(self.dvr) - pvr_lengths
         return self.normalize_pvr(pvr, pvr_lengths, missing)
 
-    def get_missing(self, length: int) -> pd.DataFrame:
-        missing = self.dvr.loc[: length - 1, "element"].copy().to_frame()
-        # missing["KL"] = self.epsilon
-        missing["KL"] = self.KLD(
-            self.dvr.loc[: length - 1, "global_weight"].copy().to_numpy(), self.epsilon
-        )
-        missing["missing"] = True
-        return missing
-
-    def create_arrays(self, df: pd.DataFrame) -> pd.DataFrame:
+    def create_arrays(self, frequency: pd.DataFrame) -> pd.DataFrame:
         """Prepares the raw data and creates signatures for every category in the domain.
         `epsilon_frac` defines the size of epsilon, default is 1/(corpus size * 2)
         `sig_length` defines the length of the signature, default is 500"""
-        pvr = self.create_pvr(df)
+        pvr = self.create_pvr(frequency)
         vecs = self.betas(pvr)
         vecs = vecs.pivot_table(
             values="local_weight", index="element", columns="category"
@@ -99,10 +90,10 @@ class LPA:
         )
         self.vecs_array = vecs.fillna(self.epsilon).to_numpy().T
 
-    def create_distances(self, df):
-        self.create_arrays(df)
-        categories = df["category"].drop_duplicates()
-        elements = df["element"].drop_duplicates().dropna().sort_values()
+    def create_distances(self, frequency: pd.DataFrame) -> pd.DataFrame:
+        self.create_arrays(frequency)
+        categories = frequency["category"].drop_duplicates()
+        elements = frequency["element"].drop_duplicates().dropna().sort_values()
         return (
             pd.DataFrame(
                 self.KLD(self.dvr_array, self.vecs_array),
@@ -120,7 +111,7 @@ class LPA:
         distances["underused"] = underused
         return distances
 
-    def cut(self, sigs: pd.DataFrame, sig_length: int = 500):
+    def cut(self, sigs: pd.DataFrame, sig_length: int = 500) -> pd.DataFrame:
         # TODO: diminishing return
         return (
             sigs.sort_values(["category", "KL"], ascending=[True, False])
@@ -129,14 +120,16 @@ class LPA:
             .reset_index(drop=True)
         )
 
-    def create_and_cut(self, df: pd.DataFrame, sig_length: int = 500) -> pd.DataFrame:
-        distances = self.create_distances(df)
+    def create_and_cut(
+        self, frequency: pd.DataFrame, sig_length: int = 500
+    ) -> pd.DataFrame:
+        distances = self.create_distances(frequency)
         sigs = self.add_underused(distances)
         cut = self.cut(sigs, sig_length)
         return cut
 
-    def distance_summary(self, df: pd.DataFrame) -> pd.DataFrame:
-        sigs = self.create_distances(df)
+    def distance_summary(self, frequency: pd.DataFrame) -> pd.DataFrame:
+        sigs = self.create_distances(frequency)
         return sigs.groupby("category").sum()
 
     @timing
@@ -210,9 +203,3 @@ class IterLPA(LPA):
         df = StandardScaler().fit_transform(df)
         pca = PCA(n_components=2)
         pcdf = pca.fit_transform(df)
-
-
-df = pd.read_csv("./frequency.csv")
-dvr = LPA.create_dvr(df)
-lpa = LPA(dvr, epsilon_frac=2)
-sigs = lpa.create_and_cut(df, sig_length=500)
