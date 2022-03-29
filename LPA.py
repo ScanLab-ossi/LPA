@@ -14,12 +14,9 @@ from helpers import timing
 
 
 class LPA:
-    def __init__(
-        self, dvr: pd.DataFrame, categories: int = 1000, epsilon_frac: int = 2
-    ):
-        self.dvr = dvr
+    def __init__(self, dvr: pd.DataFrame, epsilon_frac: int = 2):
+        self.dvr = dvr.sort_values("frequency_in_category", ascending=False)
         self.epsilon = 1 / (len(dvr) * epsilon_frac)
-        self.categories = categories
 
     @staticmethod
     def create_dvr(df: pd.DataFrame) -> pd.DataFrame:
@@ -48,88 +45,98 @@ class LPA:
         P represents the data, the observations, or a measured probability distribution.
         Q represents instead a theory, a model, a description or an approximation of P.
         """
-
         return (P - Q) * (ma.log(P) - ma.log(Q))
 
-    def extended_freq_vec(
-        self, vec: pd.DataFrame, vec_lengths: np.ndarray, missing: np.ndarray
-    ) -> pd.DataFrame:
-        # TODO: rename
+    def normalize_pvr(self, pvr, pvr_lengths, missing):
+        """
+        The extended pvr (with ɛ) is no longer a probability vector - the sum of all
+        coordinates is now larger than 1. We correct this by multiplying all non-ɛ
+        frequencies by a normalization coefficient β. This normalization coefficient is
+        given by the formula β=1-N*ɛ, where N is the number of words missing in one vector compared to the other (variable named `missing`).
+        """
         betas = [
             item
             for sublist in [
                 times * [(1 - missing * self.epsilon)[i]]
-                for i, times in enumerate(vec_lengths)
+                for i, times in enumerate(pvr_lengths)
             ]
             for item in sublist
         ]
-        vec["local_weight"] = vec["local_weight"] * pd.Series(betas)
-        return vec
+        pvr["local_weight"] = pvr["local_weight"] * pd.Series(betas)
+        return pvr
 
-    def betas(self, pvr: pd.DataFrame) -> pd.DataFrame:
+    def betas(self, pvr):
         pvr_lengths = (
             pvr["category"].drop_duplicates(keep="last").index
             - pvr["category"].drop_duplicates(keep="first").index
             + 1
         ).to_numpy()
         missing = len(self.dvr) - pvr_lengths
-        return self.extended_freq_vec(pvr, pvr_lengths, missing)
+        return self.normalize_pvr(pvr, pvr_lengths, missing)
 
     def get_missing(self, length: int) -> pd.DataFrame:
         missing = self.dvr.loc[: length - 1, "element"].copy().to_frame()
+        # missing["KL"] = self.epsilon
         missing["KL"] = self.KLD(
             self.dvr.loc[: length - 1, "global_weight"].copy().to_numpy(), self.epsilon
         )
         missing["missing"] = True
         return missing
 
-    def create_signatures(self, df: pd.DataFrame) -> pd.DataFrame:
+    def create_arrays(self, df: pd.DataFrame) -> pd.DataFrame:
         """Prepares the raw data and creates signatures for every category in the domain.
         `epsilon_frac` defines the size of epsilon, default is 1/(corpus size * 2)
         `sig_length` defines the length of the signature, default is 500"""
-        vecs = self.betas(self.create_pvr(df)).pivot_table(
+        pvr = self.create_pvr(df)
+        vecs = self.betas(pvr)
+        vecs = vecs.pivot_table(
             values="local_weight", index="element", columns="category"
         )
-        dvr_array = (
+        self.dvr_array = (
             self.dvr[self.dvr["element"].isin(vecs.index)]
             .sort_values("element")["global_weight"]
             .to_numpy()
         )
-        vecs_array = vecs.fillna(0).to_numpy().T
-        distances = (
+        self.vecs_array = vecs.fillna(self.epsilon).to_numpy().T
+
+    def create_distances(self, df):
+        self.create_arrays(df)
+        categories = df["category"].drop_duplicates()
+        elements = df["element"].drop_duplicates().dropna().sort_values()
+        return (
             pd.DataFrame(
-                self.KLD(dvr_array, vecs_array),
-                index=vecs.columns,
-                columns=vecs.index,
+                self.KLD(self.dvr_array, self.vecs_array),
+                index=categories,
+                columns=elements,
             )
             .stack()
             .reset_index()
             .rename(columns={0: "KL"})
         )
+
+    def add_underused(self, distances: pd.DataFrame) -> pd.DataFrame:
+        underused = np.greater(self.dvr_array, self.vecs_array)
+        underused = underused.reshape(np.multiply(*underused.shape))
+        distances["underused"] = underused
         return distances
 
-    def diminishing_return(
-        self, sigs: pd.DataFrame, sig_length: int = 500
-    ) -> pd.DataFrame:
-        sigs["missing"] = False
-        missing = self.get_missing(sig_length)
-        categories = sigs["category"].drop_duplicates().reset_index(drop=True)
-        merged = pd.merge(categories, missing, how="cross")
-        sigs = (
-            sigs.append(merged)
-            .sort_values(["category", "KL"], ascending=[True, False])
+    def cut(self, sigs: pd.DataFrame, sig_length: int = 500):
+        # TODO: diminishing return
+        return (
+            sigs.sort_values(["category", "KL"], ascending=[True, False])
             .groupby("category")
             .head(sig_length)
             .reset_index(drop=True)
         )
-        return sigs
 
     def create_and_cut(self, df: pd.DataFrame, sig_length: int = 500) -> pd.DataFrame:
-        sigs = self.create_signatures(df)
-        return self.diminishing_return(sigs, sig_length)
+        distances = self.create_distances(df)
+        sigs = self.add_underused(distances)
+        cut = self.cut(sigs, sig_length)
+        return cut
 
     def distance_summary(self, df: pd.DataFrame) -> pd.DataFrame:
-        sigs = self.create_signatures(df)
+        sigs = self.create_distances(df)
         return sigs.groupby("category").sum()
 
     @timing
@@ -142,7 +149,7 @@ class LPA:
         # TODO: triu
         categories1 = signatures1["category"].drop_duplicates()
         categories2 = signatures2["category"].drop_duplicates()
-        pivot = signatures1.append(signatures2).pivot_table(
+        pivot = pd.concat([signatures1, signatures2]).pivot_table(
             values="KL", index="category", columns="element", fill_value=0
         )
         XA = pivot.filter(categories1, axis="index")  # .to_numpy()
@@ -203,3 +210,9 @@ class IterLPA(LPA):
         df = StandardScaler().fit_transform(df)
         pca = PCA(n_components=2)
         pcdf = pca.fit_transform(df)
+
+
+df = pd.read_csv("./frequency.csv")
+dvr = LPA.create_dvr(df)
+lpa = LPA(dvr, epsilon_frac=2)
+sigs = lpa.create_and_cut(df, sig_length=500)
