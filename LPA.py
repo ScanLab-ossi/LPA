@@ -88,9 +88,12 @@ class LPA:
             .sort_values("element")["global_weight"]
             .to_numpy()
         )
-        self.vecs_array = vecs.fillna(self.epsilon).to_numpy().T
+        self.vecs_array = (
+            vecs.fillna(self.epsilon).replace(0, self.epsilon).to_numpy().T
+        )
 
     def create_distances(self, frequency: pd.DataFrame) -> pd.DataFrame:
+        frequency = frequency.sort_values("category").reset_index(drop=True)
         self.create_arrays(frequency)
         categories = frequency["category"].drop_duplicates()
         elements = frequency["element"].drop_duplicates().dropna().sort_values()
