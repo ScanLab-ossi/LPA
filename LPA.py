@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from importlib import import_module
 from pathlib import Path
-from types import NoneType
 from typing import List, Tuple
 
 import numpy as np
@@ -98,9 +97,9 @@ class Corpus:
         element_cat: pd.Series | None = None,
     ):
         if (
-            isinstance(freq, NoneType)
-            and isinstance(document_cat, NoneType)
-            and isinstance(element_cat, NoneType)
+            isinstance(freq, type(None))
+            and isinstance(document_cat, type(None))
+            and isinstance(element_cat, type(None))
         ):
             raise ValueError(
                 "Either use a frequency dataframe or two series, one of document ids and one of elements"
