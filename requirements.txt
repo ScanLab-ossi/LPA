@@ -1,6 +1,9 @@
-pandas>=1.2.0
+pandas>=1.5.0
 numpy
 scipy
 matplotlib
 scikit-learn
 altair
+altair_saver
+more_itertools
+bottleneck

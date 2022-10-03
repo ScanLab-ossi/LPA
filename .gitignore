@@ -2,6 +2,12 @@
 __pycache__/
 *.py[cod]
 *$py.class
+data/freq/*
+data/enron/*
+data/loco/freq/*
+data/loco/sockpuppets/*
+data/loco/sigs/*
+data/loco/json/*
 
 # C extensions
 *.so
