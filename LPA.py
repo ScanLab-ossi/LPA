@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from importlib import import_module
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Literal, Tuple
 
 import numpy as np
 import pandas as pd
@@ -19,7 +19,10 @@ class Matrix:
         self.matrix = matrix
         self.normalized = False
 
-    def _get_epsilon(self, lambda_=1):
+    def __bool__(self):
+        return True if hasattr(self, "matrix") else False
+
+    def _get_epsilon(self, lambda_=1) -> float:
         """
         λ is the contibution to the entropy by the terms with probability ε
         ε ≈ six orders of magnitude smaller than λ
@@ -95,6 +98,7 @@ class Corpus:
         freq: pd.DataFrame | None = None,
         document_cat: pd.Series | pd.DatetimeIndex | None = None,
         element_cat: pd.Series | None = None,
+        name: str | None = None,
     ):
         if (
             isinstance(freq, type(None))
@@ -110,6 +114,12 @@ class Corpus:
             element_cat = freq["element"]
         self.document_cat = pd.Categorical(document_cat, ordered=True).dtype
         self.element_cat = pd.Categorical(element_cat, ordered=True).dtype
+        if name:
+            self.name = name
+
+    def __len__(self):
+        """Number of documents"""
+        return len(self.matrix.matrix)
 
     def update_documents(self, document):
         self.document_cat = pd.CategoricalDtype(
@@ -134,14 +144,18 @@ class Corpus:
         matrix[idx[:, 0], idx[:, 1]] = freq["frequency_in_document"]
         return Matrix(matrix[min(d.cat.codes) : max(d.cat.codes) + 1])
 
-    def create_dvr(self, equally_weighted: bool = False) -> pd.DataFrame:
-        self.matrix = self.pivot(self.freq)
-        self.matrix.create_dvr(mean=equally_weighted)
+    def create_dvr(
+        self, equally_weighted: bool = False, matrix: None | Matrix = None
+    ) -> pd.DataFrame:
+        if not matrix:
+            self.matrix = self.pivot(self.freq)
+            matrix = self.matrix
+        matrix.create_dvr(mean=equally_weighted)
         dvr = (
             pd.DataFrame(
                 {
                     "element": self.element_cat.categories,
-                    "global_weight": self.matrix.dvr,
+                    "global_weight": matrix.dvr,
                 }
             )
             .reset_index()
@@ -156,17 +170,27 @@ class Corpus:
         epsilon: float,
         most_significant: int | None = 30,
         sig_length: int | None = 500,
+        prevelent: int | None = None,
     ) -> List[pd.DataFrame] | Tuple[List[pd.DataFrame]]:
+        if sig_length == 0:
+            sig_length = None
         if not hasattr(self, "matrix"):
             raise AttributeError("Please create dvr before creating signatures.")
         if not self.matrix.normalized:
             self.matrix.normalize()
-            self.matrix.epsilon_modification(epsilon)
-        self.distance_matrix = KLD_distance_overused(
-            self.matrix.matrix, self.matrix.dvr
+        if prevelent:
+            temporary_array = np.count_nonzero(self.matrix.matrix, axis=0) <= prevelent
+        self.matrix.epsilon_modification(epsilon)
+        self.distance_matrix = Matrix(
+            KLD_distance_overused(self.matrix.matrix, self.matrix.dvr)
         )
+        if prevelent:
+            self.prevelent_matrix = self.distance_matrix.matrix.copy()
+            self.prevelent_matrix[
+                temporary_array & (self.distance_matrix.matrix < 0)
+            ] = 0
         distances_df = pd.DataFrame(
-            self.distance_matrix,
+            (self.prevelent_matrix if prevelent else self.distance_matrix.matrix),
             index=self.document_cat.categories,
             columns=self.element_cat.categories,
         )
@@ -174,47 +198,46 @@ class Corpus:
             sig.loc[sig.abs().sort_values(ascending=False).index].head(sig_length)
             for _, sig in distances_df.iterrows()
         ]
+        res = [signatures]
         if most_significant:
-            sort = np.argsort(np.abs(self.distance_matrix).sum(axis=0), kind="stable")[
-                -most_significant:
-            ][::-1]
+            sort = np.argsort(
+                np.abs(self.distance_matrix.matrix).sum(axis=0), kind="stable"
+            )[-most_significant:][::-1]
             max_distances_df = distances_df.iloc[:, sort]
             max_distances = [dist for _, dist in max_distances_df.iterrows()]
-            return signatures, max_distances
+            res.append(max_distances)
+        if prevelent:
+            print("yeassss qveen")
+            res.append(temporary_array)
+        return tuple(res)
+
+
+def sockpuppet_distance(
+    corpus1: Corpus, corpus2: Corpus, res: Literal["table", "matrix"] = "table"
+) -> pd.DataFrame:
+    cc = []
+    for c in [corpus1, corpus2]:
+        if hasattr(c, "prevelent_matrix"):
+            x = np.where(
+                c.prevelent_matrix > 0, c.prevelent_matrix + 1, c.prevelent_matrix - 1
+            )
         else:
-            return signatures
-
-
-def sockpuppet_distance(corpus1: Corpus, corpus2: Corpus) -> pd.DataFrame:
-    """
-    Returns size*size df
-    """
-    # TODO: triu
+            x = np.where(
+                c.distance_matrix.matrix > 0,
+                c.distance_matrix.matrix + 1,
+                c.distance_matrix.matrix - 1,
+            )
+        cc.append(x)
     df = pd.DataFrame(
-        cdist(corpus1.distance_matrix, corpus2.distance_matrix, metric="cityblock"),
+        cdist(cc[0], cc[1], metric="cityblock"),
         index=corpus1.document_cat.categories,
         columns=corpus2.document_cat.categories,
     )
+    df /= df.max().max()
+    if res == "table":
+        df = (
+            df.rename_axis(index=getattr(corpus1, "name", "Corpus 1"))
+            .melt(ignore_index=False, var_name=getattr(corpus1, "name", "Corpus 2"))
+            .reset_index()
+        )
     return df
-
-
-# def save(self, path: Path):
-#     with open(path / "corpus.json", "w") as fp:
-#         d = {
-#             "date": self.date_cat.categories.astype(str).to_list(),
-#             "elements": self.element_cat.categories.astype(str).to_list(),
-#         }
-#         json.dump(d, fp)
-
-# @staticmethod
-# def load(path: Path) -> Corpus:
-#     with open(path / "corpus.json") as f:
-#         data = json.load(f)
-#     return Corpus(pd.to_datetime(data["date"]), pd.Series(data["elements"]))
-
-# freq = pd.read_csv("./frequency.csv")
-# corpus = Corpus(freq=freq)
-# matrix = corpus.pivot()
-# dvr = corpus.create_dvr(matrix)
-# epsilon = 1 / (len(dvr) * 2)
-# create_signatures(matrix=matrix, corpus=corpus, epsilon=epsilon)[1].sum(axis=0)
