@@ -207,7 +207,6 @@ class Corpus:
             max_distances = [dist for _, dist in max_distances_df.iterrows()]
             res.append(max_distances)
         if prevelent:
-            print("yeassss qveen")
             res.append(temporary_array)
         return tuple(res)
 
