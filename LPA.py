@@ -1,17 +1,17 @@
 from __future__ import annotations
 
+from copy import copy
 from importlib import import_module
 from pathlib import Path
 from typing import List, Literal, Tuple
 
+import bottleneck as bn
 import numpy as np
 import pandas as pd
-from scipy.special import lambertw
+from algo import KLD_distance_overused, entropy
+from helpers import read, timing, write
 from scipy.spatial.distance import cdist
-import bottleneck as bn
-
-from algo import entropy, KLD_distance_overused
-from helpers import read, write, timing
+from scipy.special import lambertw
 
 
 class Matrix:
@@ -28,6 +28,8 @@ class Matrix:
         ε ≈ six orders of magnitude smaller than λ
         """
         m = np.count_nonzero((self.matrix == 0), axis=1).max()
+        if m == 0:
+            return 0
         if lambda_ > m / (np.e * np.log(2)) or lambda_ <= 0:
             raise ValueError
         s = entropy(self.matrix).sum(axis=1).max()
@@ -44,6 +46,8 @@ class Matrix:
     ):
         if not epsilon:
             epsilon = self._get_epsilon(lambda_)
+            if epsilon == 0:
+                return
         beta = 1 - epsilon * np.count_nonzero(self.matrix <= threshold, axis=1)
         self.matrix = self.matrix * beta[:, None]
         self.matrix[self.matrix <= threshold] = epsilon
@@ -79,8 +83,8 @@ class Matrix:
             self.dvr = self.normalized_weight()
 
     def normalized_average_weight(self) -> np.ndarray:
-        average_weight = bn.nanmean(self.matrix, axis=0)
-        return average_weight / average_weight.sum()
+        x = (self.matrix.T / self.matrix.sum(axis=1)).T
+        return bn.nanmean(x, axis=0)
 
     def normalized_weight(self) -> np.ndarray:
         return self.matrix.sum(axis=0) / self.matrix.sum()
@@ -120,6 +124,15 @@ class Corpus:
     def __len__(self):
         """Number of documents"""
         return len(self.matrix.matrix)
+
+    def current(self, m=True):
+        if hasattr(self, "signature_matrix"):
+            curr = self.prevelent_matrix
+        elif hasattr(self, "prevelent_matrix"):
+            curr = self.prevelent_matrix
+        elif hasattr(self, "distance_matrix"):
+            curr = self.distance_matrix
+        return curr.matrix if m else curr
 
     def update_documents(self, document):
         self.document_cat = pd.CategoricalDtype(
@@ -165,6 +178,37 @@ class Corpus:
         )
         return dvr[["element", "global_weight"]]
 
+    def _prevelent_matrix(self, temporary_array):
+        self.prevelent_matrix = copy(self.distance_matrix)
+        self.prevelent_matrix.matrix[
+            temporary_array & (self.distance_matrix.matrix < 0)
+        ] = 0
+
+    def _signature_matrix(self, sig_length, distances_df):
+        # annuls all values that shouldn't appear in the signatures
+        self.signature_matrix = Matrix(self.current().copy())  # copy?
+        if sig_length:
+            argsort = np.argsort(np.abs(self.signature_matrix.matrix), axis=1)
+            indices = argsort[:, -sig_length:]
+            p = np.zeros_like(self.signature_matrix.matrix)
+            for i in range(p.shape[0]):
+                p[i, indices[i]] = self.signature_matrix.matrix[i, indices[i]]
+            self.signature_matrix.matrix = p
+        signatures = [
+            sig[1][self.signature_matrix.matrix[i] != 0].sort_values(
+                key=lambda x: abs(x), ascending=False
+            )
+            for i, sig in enumerate(distances_df.iterrows())
+        ]
+        return signatures
+
+    def _most_significant(self, most_significant, distances_df):
+        sort = np.argsort(
+            np.abs(self.distance_matrix.matrix).sum(axis=0), kind="stable"
+        )[-most_significant:][::-1]
+        # max_distances = [dist for _, dist in max_distances_df.iterrows()]
+        return distances_df.iloc[:, sort]
+
     def create_signatures(
         self,
         epsilon: float,
@@ -172,6 +216,9 @@ class Corpus:
         sig_length: int | None = 500,
         prevelent: int | None = None,
     ) -> List[pd.DataFrame] | Tuple[List[pd.DataFrame]]:
+        """
+        most_significant: checks which elements had the largest distance altogether and returns a dataframe consisting only of those distances, sorted
+        """
         if sig_length == 0:
             sig_length = None
         if not hasattr(self, "matrix"):
@@ -185,27 +232,15 @@ class Corpus:
             KLD_distance_overused(self.matrix.matrix, self.matrix.dvr)
         )
         if prevelent:
-            self.prevelent_matrix = self.distance_matrix.matrix.copy()
-            self.prevelent_matrix[
-                temporary_array & (self.distance_matrix.matrix < 0)
-            ] = 0
+            self._prevelent_matrix(temporary_array)
         distances_df = pd.DataFrame(
-            (self.prevelent_matrix if prevelent else self.distance_matrix.matrix),
+            self.current(),
             index=self.document_cat.categories,
             columns=self.element_cat.categories,
         )
-        signatures = [
-            sig.loc[sig.abs().sort_values(ascending=False).index].head(sig_length)
-            for _, sig in distances_df.iterrows()
-        ]
-        res = [signatures]
+        res = [self._signature_matrix(sig_length, distances_df)]
         if most_significant:
-            sort = np.argsort(
-                np.abs(self.distance_matrix.matrix).sum(axis=0), kind="stable"
-            )[-most_significant:][::-1]
-            max_distances_df = distances_df.iloc[:, sort]
-            max_distances = [dist for _, dist in max_distances_df.iterrows()]
-            res.append(max_distances)
+            res.append(self._most_significant(most_significant, distances_df))
         if prevelent:
             res.append(temporary_array)
         return tuple(res)
@@ -216,17 +251,12 @@ def sockpuppet_distance(
 ) -> pd.DataFrame:
     cc = []
     for c in [corpus1, corpus2]:
-        if hasattr(c, "prevelent_matrix"):
-            x = np.where(
-                c.prevelent_matrix > 0, c.prevelent_matrix + 1, c.prevelent_matrix - 1
-            )
-        else:
-            x = np.where(
-                c.distance_matrix.matrix > 0,
-                c.distance_matrix.matrix + 1,
-                c.distance_matrix.matrix - 1,
-            )
-        cc.append(x)
+        matrix = copy(c.signature_matrix)
+        matrix.matrix = matrix.matrix[:, ~np.all(matrix.matrix == 0, axis=0)]
+        matrix.matrix[matrix.matrix > 0] += 1
+        matrix.matrix[matrix.matrix < 0] -= 1
+        matrix.epsilon_modification()
+        cc.append(matrix.matrix)
     df = pd.DataFrame(
         cdist(cc[0], cc[1], metric="cityblock"),
         index=corpus1.document_cat.categories,
@@ -234,9 +264,13 @@ def sockpuppet_distance(
     )
     df /= df.max().max()
     if res == "table":
+        c1n = getattr(corpus1, "name", "Corpus 2")
+        c2n = getattr(corpus2, "name", "Corpus 1")
+        if c1n == c2n:
+            c2n = c1n + " "
         df = (
-            df.rename_axis(index=getattr(corpus1, "name", "Corpus 1"))
-            .melt(ignore_index=False, var_name=getattr(corpus1, "name", "Corpus 2"))
+            df.rename_axis(index=c1n)
+            .melt(ignore_index=False, var_name=c2n)
             .reset_index()
         )
     return df
