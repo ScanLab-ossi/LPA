@@ -3,7 +3,6 @@ numpy
 scipy
 matplotlib
 scikit-learn
-altair
+altair>=4.2.2
 altair_saver
-more_itertools
 bottleneck

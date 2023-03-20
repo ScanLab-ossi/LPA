@@ -2,16 +2,20 @@ from __future__ import annotations
 
 from copy import copy
 from importlib import import_module
+from itertools import combinations_with_replacement as cwr
 from pathlib import Path
 from typing import List, Literal, Tuple
 
 import bottleneck as bn
 import numpy as np
 import pandas as pd
-from algo import KLD_distance_overused, entropy
-from helpers import read, timing, write
 from scipy.spatial.distance import cdist
 from scipy.special import lambertw
+from sklearn import decomposition as skd
+from sklearn.preprocessing import StandardScaler
+
+from algo import symmetrized_KLD, entropy
+from helpers import write
 
 
 class Matrix:
@@ -22,22 +26,6 @@ class Matrix:
     def __bool__(self):
         return True if hasattr(self, "matrix") else False
 
-    def _get_epsilon(self, lambda_=1) -> float:
-        """
-        λ is the contibution to the entropy by the terms with probability ε
-        ε ≈ six orders of magnitude smaller than λ
-        """
-        m = np.count_nonzero((self.matrix == 0), axis=1).max()
-        if m == 0:
-            return 0
-        if lambda_ > m / (np.e * np.log(2)) or lambda_ <= 0:
-            raise ValueError
-        s = entropy(self.matrix).sum(axis=1).max()
-        res = np.minimum(
-            np.e ** lambertw(-lambda_ * np.log(2) / m, k=-1).real, 2 ** (-s)
-        )
-        return res
-
     def epsilon_modification(
         self,
         epsilon: float | None = None,
@@ -45,9 +33,12 @@ class Matrix:
         threshold: float = 0,
     ):
         if not epsilon:
-            epsilon = self._get_epsilon(lambda_)
             if epsilon == 0:
                 return
+            raise ValueError("Epsilon must be provided")
+            # epsilon = self._get_epsilon(lambda_)
+            # if epsilon == 0:
+            #     return
         beta = 1 - epsilon * np.count_nonzero(self.matrix <= threshold, axis=1)
         self.matrix = self.matrix * beta[:, None]
         self.matrix[self.matrix <= threshold] = epsilon
@@ -74,17 +65,10 @@ class Matrix:
         self.normalized = True
         self.matrix = (self.matrix.T / self.matrix.sum(axis=1)).T
 
-    def create_dvr(self, mean=False):
+    def create_dvr(self):
         if self.normalized:
             raise ValueError("Cannot create the DVR from normalized frequency data")
-        if mean:
-            self.dvr = self.normalized_average_weight()
-        else:
-            self.dvr = self.normalized_weight()
-
-    def normalized_average_weight(self) -> np.ndarray:
-        x = (self.matrix.T / self.matrix.sum(axis=1)).T
-        return bn.nanmean(x, axis=0)
+        self.dvr = self.normalized_weight()
 
     def normalized_weight(self) -> np.ndarray:
         return self.matrix.sum(axis=0) / self.matrix.sum()
@@ -127,9 +111,7 @@ class Corpus:
 
     def current(self, m=True):
         if hasattr(self, "signature_matrix"):
-            curr = self.prevelent_matrix
-        elif hasattr(self, "prevelent_matrix"):
-            curr = self.prevelent_matrix
+            curr = self.signature_matrix
         elif hasattr(self, "distance_matrix"):
             curr = self.distance_matrix
         return curr.matrix if m else curr
@@ -157,13 +139,11 @@ class Corpus:
         matrix[idx[:, 0], idx[:, 1]] = freq["frequency_in_document"]
         return Matrix(matrix[min(d.cat.codes) : max(d.cat.codes) + 1])
 
-    def create_dvr(
-        self, equally_weighted: bool = False, matrix: None | Matrix = None
-    ) -> pd.DataFrame:
+    def create_dvr(self, matrix: None | Matrix = None) -> pd.DataFrame:
         if not matrix:
             self.matrix = self.pivot(self.freq)
             matrix = self.matrix
-        matrix.create_dvr(mean=equally_weighted)
+        matrix.create_dvr()
         dvr = (
             pd.DataFrame(
                 {
@@ -177,12 +157,6 @@ class Corpus:
             .reset_index(drop=True)
         )
         return dvr[["element", "global_weight"]]
-
-    def _prevelent_matrix(self, temporary_array):
-        self.prevelent_matrix = copy(self.distance_matrix)
-        self.prevelent_matrix.matrix[
-            temporary_array & (self.distance_matrix.matrix < 0)
-        ] = 0
 
     def _signature_matrix(self, sig_length, distances_df):
         # annuls all values that shouldn't appear in the signatures
@@ -202,19 +176,11 @@ class Corpus:
         ]
         return signatures
 
-    def _most_significant(self, most_significant, distances_df):
-        sort = np.argsort(
-            np.abs(self.distance_matrix.matrix).sum(axis=0), kind="stable"
-        )[-most_significant:][::-1]
-        # max_distances = [dist for _, dist in max_distances_df.iterrows()]
-        return distances_df.iloc[:, sort]
-
     def create_signatures(
         self,
-        epsilon: float,
-        most_significant: int | None = 30,
+        epsilon: float | None = None,
         sig_length: int | None = 500,
-        prevelent: int | None = None,
+        distance: str = "KLDe",
     ) -> List[pd.DataFrame] | Tuple[List[pd.DataFrame]]:
         """
         most_significant: checks which elements had the largest distance altogether and returns a dataframe consisting only of those distances, sorted
@@ -225,52 +191,65 @@ class Corpus:
             raise AttributeError("Please create dvr before creating signatures.")
         if not self.matrix.normalized:
             self.matrix.normalize()
-        if prevelent:
-            temporary_array = np.count_nonzero(self.matrix.matrix, axis=0) <= prevelent
-        self.matrix.epsilon_modification(epsilon)
-        self.distance_matrix = Matrix(
-            KLD_distance_overused(self.matrix.matrix, self.matrix.dvr)
-        )
-        if prevelent:
-            self._prevelent_matrix(temporary_array)
+        if distance == "KLDe":
+            self.matrix.epsilon_modification(epsilon)
+        dm = symmetrized_KLD(self.matrix.matrix, self.matrix.dvr)
+        self.distance_matrix = Matrix(dm)
         distances_df = pd.DataFrame(
             self.current(),
             index=self.document_cat.categories,
             columns=self.element_cat.categories,
         )
-        res = [self._signature_matrix(sig_length, distances_df)]
-        if most_significant:
-            res.append(self._most_significant(most_significant, distances_df))
-        if prevelent:
-            res.append(temporary_array)
-        return tuple(res)
+        res = self._signature_matrix(sig_length, distances_df)
+        return res
 
 
 def sockpuppet_distance(
-    corpus1: Corpus, corpus2: Corpus, res: Literal["table", "matrix"] = "table"
+    corpus1: Corpus,
+    corpus2: Corpus,
+    res: Literal["table", "matrix"] = "table",
+    heuristic: bool = True,
 ) -> pd.DataFrame:
-    cc = []
+    matrices = []
     for c in [corpus1, corpus2]:
         matrix = copy(c.signature_matrix)
         matrix.matrix = matrix.matrix[:, ~np.all(matrix.matrix == 0, axis=0)]
-        matrix.matrix[matrix.matrix > 0] += 1
-        matrix.matrix[matrix.matrix < 0] -= 1
-        matrix.epsilon_modification()
-        cc.append(matrix.matrix)
+        if heuristic:
+            matrix.matrix[matrix.matrix > 0] += 1
+            matrix.matrix[matrix.matrix < 0] -= 1
+        matrices.append(matrix.matrix)
+    c1n = getattr(corpus2, "name", "Corpus 1")
+    c2n = getattr(corpus1, "name", "Corpus 2")
+    cdist_ = cdist(matrices[0], matrices[1], metric="cityblock")
+    cdist_[np.triu_indices(len(cdist_), k=1)] = np.nan
     df = pd.DataFrame(
-        cdist(cc[0], cc[1], metric="cityblock"),
+        cdist_,
         index=corpus1.document_cat.categories,
         columns=corpus2.document_cat.categories,
     )
-    df /= df.max().max()
-    if res == "table":
-        c1n = getattr(corpus1, "name", "Corpus 2")
-        c2n = getattr(corpus2, "name", "Corpus 1")
-        if c1n == c2n:
-            c2n = c1n + " "
-        df = (
-            df.rename_axis(index=c1n)
-            .melt(ignore_index=False, var_name=c2n)
-            .reset_index()
-        )
+    if c1n == c2n:
+        c2n = c1n + " "
+    df = (
+        df.rename_axis(index=c1n)
+        .melt(ignore_index=False, var_name=c2n)
+        .dropna()
+        .reset_index()
+    )
+    df["value"] /= df["value"].max()
+    if res == "matrix":
+        df = df.pivot(index=c1n, columns=c2n, values="value").fillna(0)
+        df = df + df.T
     return df
+
+
+def PCA(sockpuppet_matrix, n_components: int = 2):
+    """
+    Creates a PCA object and returns it, as well as the explained variance ratio.
+    """
+    scaler = StandardScaler()
+    sockpuppet_matrix = scaler.fit_transform(sockpuppet_matrix)
+    scaled_matrix = scaler.fit_transform(sockpuppet_matrix)
+    pca = skd.PCA(n_components=n_components)
+    pca.fit(scaled_matrix)
+    res = pca.transform(scaled_matrix)
+    return res, pca.explained_variance_ratio_
